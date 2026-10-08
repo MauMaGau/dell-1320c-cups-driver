@@ -44,8 +44,9 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 /* Paper code mapping (PageSize name -> HBPL paper code)              */
 /*                                                                    */
-/* Codes match foo2hbpl1's table (its value >> 1), which writes them  */
-/* into the 0x94 page-header field.                                   */
+/* Codes match the vendor FXM_HBPL's GetPageSizeSetting(), which      */
+/* writes them into the 0x94 page-header field (foo2hbpl1 agrees on   */
+/* the common sizes: its value >> 1).                                 */
 /* ------------------------------------------------------------------ */
 
 static int
@@ -63,7 +64,13 @@ paper_code_by_name(const char *name)
         return 11;
     if (strcmp(name, "A5") == 0)
         return 15;
-    return -1;
+    if (strcmp(name, "FXPostcard") == 0)
+        return 13;
+    if (strcmp(name, "FanFoldGermanLegal") == 0)   /* Folio */
+        return 0xcd;
+    if (strcmp(name, "Custom") == 0)
+        return 0xff;
+    return 2;   /* vendor defaults unrecognised names to A4 */
 }
 
 /*
@@ -75,11 +82,13 @@ static int
 paper_code_by_size(uint32_t w, uint32_t h)
 {
     static const struct { int pts_w, pts_h, code; } sizes[] = {
+        { 283, 420, 13 },   /* Japanese Postcard */
         { 420, 595, 15 },   /* A5 */
         { 516, 729, 11 },   /* B5 (JIS) */
         { 522, 756, 3 },    /* Executive */
         { 595, 842, 2 },    /* A4 */
         { 612, 792, 0 },    /* Letter */
+        { 612, 936, 0xcd }, /* Folio */
         { 612, 1008, 1 },   /* Legal */
     };
     double pw = w * 72.0 / 600.0, ph = h * 72.0 / 600.0;
@@ -91,45 +100,6 @@ paper_code_by_size(uint32_t w, uint32_t h)
             return sizes[i].code;
     }
     return 0;   /* Letter */
-}
-
-static int
-hbpl_paper_code(const char *options)
-{
-    ppd_file_t *ppd;
-    cups_option_t *opts = NULL;
-    int num_opts = 0;
-    ppd_choice_t *choice;
-    int code = -1;
-    const char *ppd_path = getenv("PPD");
-
-    if (!ppd_path) {
-        return -1;
-    }
-
-    ppd = ppdOpenFile(ppd_path);
-    if (!ppd) {
-        return -1;
-    }
-
-    ppdMarkDefaults(ppd);
-    if (options && options[0]) {
-        num_opts = cupsParseOptions(options, 0, &opts);
-        if (num_opts > 0) {
-            cupsMarkOptions(ppd, num_opts, opts);
-        }
-    }
-
-    choice = ppdFindMarkedChoice(ppd, "PageSize");
-    if (choice != NULL) {
-        code = paper_code_by_name(choice->choice);
-    }
-
-    if (opts) {
-        cupsFreeOptions(num_opts, opts);
-    }
-    ppdClose(ppd);
-    return code;
 }
 
 /* ------------------------------------------------------------------ */
@@ -214,23 +184,30 @@ write_pjl(FILE *out, const char *user, const char *title, int copies)
     fprintf(out, "@PJL ENTER LANGUAGE=HBPL\n");
 }
 
-static int
-hbpl_input_slot(const char *options)
+/*
+ * Read the job's FXInputSlot and PageSize from the PPD in one pass.
+ * Without a PPD, *slot is 0 and *paper is -1 (caller falls back to the
+ * raster size).
+ */
+static void
+hbpl_job_options(const char *options, int *slot, int *paper)
 {
     ppd_file_t *ppd;
     cups_option_t *opts = NULL;
     int num_opts = 0;
     ppd_choice_t *choice;
-    int slot = 0;
     const char *ppd_path = getenv("PPD");
 
+    *slot = 0;
+    *paper = -1;
+
     if (!ppd_path) {
-        return 0;
+        return;
     }
 
     ppd = ppdOpenFile(ppd_path);
     if (!ppd) {
-        return 0;
+        return;
     }
 
     ppdMarkDefaults(ppd);
@@ -244,21 +221,23 @@ hbpl_input_slot(const char *options)
     choice = ppdFindMarkedChoice(ppd, "FXInputSlot");
     if (choice != NULL) {
         if (strcmp(choice->choice, "1stTray-S") == 0) {
-            slot = 2;
+            *slot = 2;
         } else if (strcmp(choice->choice, "1stTray-H") == 0) {
-            slot = 2;
+            *slot = 2;
         } else if (strcmp(choice->choice, "2ndTray-H") == 0) {
-            slot = 3;
-        } else {
-            slot = 0;
+            *slot = 3;
         }
+    }
+
+    choice = ppdFindMarkedChoice(ppd, "PageSize");
+    if (choice != NULL) {
+        *paper = paper_code_by_name(choice->choice);
     }
 
     if (opts) {
         cupsFreeOptions(num_opts, opts);
     }
     ppdClose(ppd);
-    return slot;
 }
 
 /* ------------------------------------------------------------------ */
@@ -293,8 +272,7 @@ main(int argc, char *argv[])
     copies = atoi(argv[4]);
     if (copies < 1) copies = 1;
     options = argv[5];
-    input_slot = hbpl_input_slot(options);
-    job_paper_code = hbpl_paper_code(options);
+    hbpl_job_options(options, &input_slot, &job_paper_code);
 
     if (argc >= 7 && argv[6] && argv[6][0]) {
         in = fopen(argv[6], "rb");
@@ -354,7 +332,7 @@ main(int argc, char *argv[])
             ph[off++] = 0x93; ph[off++] = 0xa1;
             ph[off++] = 0x01;                           /* unknown */
             ph[off++] = 0x94; ph[off++] = 0xa1;
-            ph[off++] = (unsigned char)pc;              /* paper size: 0=Letter, 2=A4 (see foo2hbpl1) */
+            ph[off++] = (unsigned char)pc;              /* paper size: 0=Letter, 2=A4 (GetPageSizeSetting) */
             ph[off++] = 0x95; ph[off++] = 0xc2;
             ph[off++] = 0x00; ph[off++] = 0x00;
             ph[off++] = 0x00; ph[off++] = 0x00;        /* paper dims zeros */
